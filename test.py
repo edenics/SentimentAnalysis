@@ -60,7 +60,6 @@ try:
 except FileNotFoundError:
     logging.error(f"文件 {file_path} 未找到，请检查路径！")
     exit()
-
 # 加载或提取特征
 if not os.path.exists(feature_file):
     logging.info(f"特征文件 {feature_file} 未找到，重新提取特征...")
