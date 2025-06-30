@@ -11,6 +11,8 @@ import os
 from collections import Counter
 from transformers import BertTokenizer, BertModel
 import json
+import time
+from tqdm import tqdm  # Added for progress bar
 
 # 设置全局变量
 TRAIN_SIZE = 0.4  # 训练集比例
@@ -22,7 +24,7 @@ MLP_HIDDEN_LAYERS = (20, 10)  # MLP 隐藏层结构
 MIN_DISTANCE_CHANGE = 0.01  # 早停条件：最小距离变化阈值
 MAX_DISTANCE_THRESHOLD = 2.4  # 最大距离阈值
 GAMMA = 1.27  # 距离阈值衰减系数
-DISTANCE_SCALING_FACTOR = 1  # 距离阈值缩放系数
+DISTANCE_SCALING_FACTOR = 1.1  # 距离阈值缩放系数
 INIT_DISTANCE_SCALING_FACTOR = 0.6
 
 # 设置日志
@@ -41,7 +43,7 @@ set_seed(42)
 
 # 文件路径
 file_path = 'ChnSentiCorp_htl_all.csv'
-feature_file = 'bert_features_hybrid_v5.npy'
+feature_file = 'bert_features.npy'
 
 # 读取数据
 labels = []
@@ -60,24 +62,48 @@ try:
 except FileNotFoundError:
     logging.error(f"文件 {file_path} 未找到，请检查路径！")
     exit()
-# 加载或提取特征
-if not os.path.exists(feature_file):
-    logging.info(f"特征文件 {feature_file} 未找到，重新提取特征...")
-    tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
-    model = BertModel.from_pretrained('bert-base-chinese')
-    model.eval()
-    features = []
+
+# 初始化 BERT
+local_model_path = './roberta-base-finetuned-dianping-chinese'
+tokenizer = BertTokenizer.from_pretrained(local_model_path)
+model = BertModel.from_pretrained(local_model_path)
+model.eval()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+logging.info(f"使用设备：{device}")
+
+# 获取注意力加权句子嵌入
+def get_attention_weighted_embedding(text, batch_size=32):
+    inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=512).to(device)
     with torch.no_grad():
-        for text in data:
-            inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=128)
-            outputs = model(**inputs)
-            features.append(outputs.last_hidden_state[:, 0, :].numpy())  # 使用 [CLS] 标记的向量
-    s_array = np.vstack(features)
-    np.save(feature_file, s_array)
-    logging.info(f"特征提取完成，保存到 {feature_file}，形状：{s_array.shape}")
-else:
-    s_array = np.load(feature_file)
-    logging.info(f"加载特征矩阵形状：{s_array.shape}")
+        outputs = model(**inputs)
+        last_hidden_states = outputs.last_hidden_state
+        attention_mask = inputs['attention_mask']
+        attention_scores = torch.softmax(last_hidden_states.mean(dim=2), dim=1)
+        attention_scores = attention_scores * attention_mask
+        attention_scores = attention_scores / (attention_scores.sum(dim=1, keepdim=True) + 1e-10)
+        weighted_embedding = (last_hidden_states * attention_scores.unsqueeze(-1)).sum(dim=1)
+    return weighted_embedding.cpu().numpy()
+
+# 批处理提取特征
+def extract_features_with_attention(data, batch_size=32, save_path=feature_file):
+    if os.path.exists(save_path):
+        logging.info(f"从本地文件 {save_path} 加载特征...")
+        return np.load(save_path)
+    s_list = []
+    for i in tqdm(range(0, len(data), batch_size), desc="提取注意力特征"):
+        batch_data = data[i:i + batch_size]
+        batch_vectors = get_attention_weighted_embedding(batch_data, batch_size)
+        s_list.extend(batch_vectors)
+    s_array = np.array(s_list)
+    np.save(save_path, s_array)
+    logging.info(f"特征已保存到 {save_path}, 形状：{s_array.shape}")
+    return s_array
+
+# 提取特征
+start_time = time.time()
+s_array = extract_features_with_attention(data)
+logging.info(f"注意力特征矩阵形状：{s_array.shape}, 提取耗时：{time.time() - start_time:.2f}秒")
 
 # 划分训练集和测试集
 X_train, X_test, y_train, y_test = train_test_split(
