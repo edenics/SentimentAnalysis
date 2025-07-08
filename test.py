@@ -8,11 +8,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.decomposition import PCA
 import logging
 import os
+import time
+from tqdm import tqdm 
 from collections import Counter
 from transformers import BertTokenizer, BertModel
-import json
-import time
-from tqdm import tqdm  # Added for progress bar
 
 # 设置全局变量
 TRAIN_SIZE = 0.4  # 训练集比例
@@ -21,8 +20,8 @@ FIXED_CONFIDENCE_THRESHOLD_1 = 0.8  # 固定置信度阈值1
 FIXED_CONFIDENCE_THRESHOLD_2 = 0.9  # 固定置信度阈值2
 NUM_RUNS = 10  # 实验运行次数
 MLP_HIDDEN_LAYERS = (20, 10)  # MLP 隐藏层结构
-MIN_DISTANCE_CHANGE = 0.01  # 早停条件：最小距离变化阈值
-MAX_DISTANCE_THRESHOLD = 2.4  # 最大距离阈值
+MIN_DISTANCE_CHANGE = 0.02  # 早停条件：最小距离变化阈值
+MAX_DISTANCE_THRESHOLD = 2.0  # 最大距离阈值
 GAMMA = 1.27  # 距离阈值衰减系数
 DISTANCE_SCALING_FACTOR = 1.1  # 距离阈值缩放系数
 INIT_DISTANCE_SCALING_FACTOR = 0.6
@@ -223,7 +222,7 @@ class PaperDASHClassifier:
                 break
         labeled_mask = self.transduction_ != -1
         self.weights = [1.0]
-        self.base_estimators[0].fit(X[labeled_mask], self.transduction_[labeled_mask])
+        self.base_estimators[0].fit(X[labeled_mask], self.transduction_[labeled_mask])  # 修正此行
         return self
 
     def predict(self, X):
@@ -262,7 +261,7 @@ class ImprovedDASHClassifier:
         if iteration == 0:
             self.initial_distance = mean_dist
             threshold = mean_dist - INIT_DISTANCE_SCALING_FACTOR * std_dist
-            threshold = min(threshold, MAX_DISTANCE_THRESHOLD)  # 限制不超过最大阈值
+            threshold = min(threshold, MAX_DISTANCE_THRESHOLD)
         else:
             threshold = DISTANCE_SCALING_FACTOR * self.gamma ** (-iteration) * self.initial_distance
             threshold = min(threshold, MAX_DISTANCE_THRESHOLD)
@@ -274,7 +273,7 @@ class ImprovedDASHClassifier:
     def _estimate_pseudo_label_quality(self, predictions, y_unlabeled_true, final_mask, unlabeled_indices, labeled_size):
         pseudo_labels = predictions[final_mask]
         if len(pseudo_labels) > 0:
-            selected_indices = unlabeled_indices[final_mask] - labeled_size  # Adjust for labeled offset
+            selected_indices = unlabeled_indices[final_mask] - labeled_size
             true_labels = y_unlabeled_true[selected_indices]
             correct = np.sum(pseudo_labels == true_labels)
             total = len(pseudo_labels)
@@ -337,7 +336,6 @@ class ImprovedDASHClassifier:
             self.transduction_ = self._fit_iteration(X, self.transduction_, unlabeled_indices, y_unlabeled_true, iteration, labeled_size)
             self.convergence_iteration = iteration + 1
 
-            # 早停条件：仅对 full 模式启用基于 min_distances 均值变化的早停
             if self.ablation == 'full':
                 mean_dist = self.mean_distances[-1] if self.mean_distances else None
                 if iteration > 0 and self.prev_mean_dist is not None and abs(mean_dist - self.prev_mean_dist) < MIN_DISTANCE_CHANGE:
@@ -348,7 +346,6 @@ class ImprovedDASHClassifier:
                     break
                 self.prev_mean_dist = mean_dist
 
-            # 其他早停条件：检查伪标签是否收敛
             if np.array_equal(y_old, self.transduction_):
                 if self.verbose:
                     logging.info(f"[B-{self.ablation}] 迭代 {iteration+1} 收敛，终止训练")
@@ -368,11 +365,12 @@ class ImprovedDASHClassifier:
 
 # 算法 C（基于固定置信度）
 class FixedConfidenceDASHClassifier:
-    def __init__(self, base_estimators, fixed_confidence, max_iter=150, verbose=True, ablation=''):
+    def __init__(self, base_estimators, fixed_confidence, max_iter=100, verbose=True, ablation=''):
         self.base_estimators = base_estimators
         self.fixed_confidence = fixed_confidence
         self.max_iter = max_iter
         self.verbose = verbose
+        self.ablation = ablation
         self.transduction_ = None
         self.convergence_iteration = 0
         self.weights = None
@@ -380,7 +378,7 @@ class FixedConfidenceDASHClassifier:
     def _estimate_pseudo_label_quality(self, predictions, y_unlabeled_true, final_mask, unlabeled_indices, labeled_size):
         pseudo_labels = predictions[final_mask]
         if len(pseudo_labels) > 0:
-            selected_indices = unlabeled_indices[final_mask] - labeled_size  # Adjust for labeled offset
+            selected_indices = unlabeled_indices[final_mask] - labeled_size
             true_labels = y_unlabeled_true[selected_indices]
             correct = np.sum(pseudo_labels == true_labels)
             total = len(pseudo_labels)
@@ -419,7 +417,6 @@ class FixedConfidenceDASHClassifier:
             self.transduction_ = self._fit_iteration(X, self.transduction_, unlabeled_indices, y_unlabeled_true, iteration, labeled_size)
             self.convergence_iteration = iteration + 1
 
-            # 仅检查伪标签是否收敛
             if np.array_equal(y_old, self.transduction_):
                 if self.verbose:
                     logging.info(f"[C-{self.ablation}] 迭代 {iteration+1} 收敛，终止训练")
@@ -590,7 +587,7 @@ def train_and_evaluate_with_mlp():
 
             # 算法 C（固定置信度 0.8）
             dash_c_fixed_08 = FixedConfidenceDASHClassifier(
-                base_estimators, fixed_confidence=FIXED_CONFIDENCE_THRESHOLD_1, max_iter=150, verbose=False, ablation='fixed_0.8'
+                base_estimators, fixed_confidence=FIXED_CONFIDENCE_THRESHOLD_1, max_iter=100, verbose=False, ablation='fixed_0.8'
             )
             dash_c_fixed_08.fit(X_all, y_all, y_unlabeled_true, labeled_size=len(X_labeled))
             pred_c_fixed_08 = dash_c_fixed_08.predict(X_test)
@@ -610,7 +607,7 @@ def train_and_evaluate_with_mlp():
 
             # 算法 C（固定置信度 0.9）
             dash_c_fixed_09 = FixedConfidenceDASHClassifier(
-                base_estimators, fixed_confidence=FIXED_CONFIDENCE_THRESHOLD_2, max_iter=150, verbose=False, ablation='fixed_0.9'
+                base_estimators, fixed_confidence=FIXED_CONFIDENCE_THRESHOLD_2, max_iter=100, verbose=False, ablation='fixed_0.9'
             )
             dash_c_fixed_09.fit(X_all, y_all, y_unlabeled_true, labeled_size=len(X_labeled))
             pred_c_fixed_09 = dash_c_fixed_09.predict(X_test)
@@ -668,7 +665,6 @@ def train_and_evaluate_with_mlp():
             std_value = np.std(run_data) if len(run_data) > 1 else 0.0
             avg_list.append((avg_value, std_value))
 
-        # 计算 mean_distances 平均值
         max_iterations = max(len(distances) for distances in mean_distances_runs)
         mean_distances_avg = []
         for i in range(max_iterations):
@@ -817,9 +813,9 @@ def train_and_evaluate():
 
     model_name = 'Single Model (MLP)'
     print(f"\n表 1：情感分类精度对比 ({model_name})")
-    print("| 方法                     | 标记样本量 (比例) | 测试集Acc       | 测试集F1       |")
-    print("|--------------------------|------------------|----------------|----------------|")
-    print(f"| 全监督                   | 100%             | {acc_full:.4f} ± {std_acc_full:.4f} | {f1_full:.4f} ± {std_f1_full:.4f} |")
+    print("| 方法                     | 标记样本量 (比例) | 测试集Acc      | 测试集F1       |")
+    print("|--------------------------|------------------|---------------|---------------|")
+    print(f"| 全监督                   | 100%             | {acc_full:.3f} ± {std_acc_full:.3f} | {f1_full:.3f} ± {std_f1_full:.3f} |")
     for n_labeled, ratio, (acc_noise, std_acc_noise), (f1_noise, std_f1_noise), (acc_a, std_acc_a), (f1_a, std_f1_a), (acc_b_full, std_acc_b_full), (f1_b_full, std_f1_b_full), (acc_b_no_stop, std_acc_b_no_stop), (f1_b_no_stop, std_f1_b_no_stop), (acc_c_fixed_08, std_acc_c_fixed_08), (f1_c_fixed_08, std_f1_c_fixed_08), (acc_c_fixed_09, std_acc_c_fixed_09), (f1_c_fixed_09, std_f1_c_fixed_09) in zip(
         [max(4, int(len(X_train) * r)) for r in [0.01, 0.02, 0.03]],
         final_result['ratio_list'],
@@ -836,16 +832,16 @@ def train_and_evaluate():
         final_result['c_fixed_09_test_acc_list'],
         final_result['c_fixed_09_test_f1_list']
     ):
-        print(f"| 全监督（部分数据）        | {n_labeled} ({ratio*100:.2f}%) | {acc_noise:.4f} ± {std_acc_noise:.4f} | {f1_noise:.4f} ± {std_f1_noise:.4f} |")
-        print(f"| 算法 A (DASH)            | {n_labeled} ({ratio*100:.2f}%) | {acc_a:.4f} ± {std_acc_a:.4f} | {f1_a:.4f} ± {std_f1_a:.4f} |")
-        print(f"| 算法 B (带早停)          | {n_labeled} ({ratio*100:.2f}%) | {acc_b_full:.4f} ± {std_acc_b_full:.4f} | {f1_b_full:.4f} ± {std_f1_b_full:.4f} |")
-        print(f"| 算法 B (无早停)          | {n_labeled} ({ratio*100:.2f}%) | {acc_b_no_stop:.4f} ± {std_acc_b_no_stop:.4f} | {f1_b_no_stop:.4f} ± {std_f1_b_no_stop:.4f} |")
-        print(f"| 算法 C (固定置信度0.8)   | {n_labeled} ({ratio*100:.2f}%) | {acc_c_fixed_08:.4f} ± {std_acc_c_fixed_08:.4f} | {f1_c_fixed_08:.4f} ± {std_f1_c_fixed_08:.4f} |")
-        print(f"| 算法 C (固定置信度0.9)   | {n_labeled} ({ratio*100:.2f}%) | {acc_c_fixed_09:.4f} ± {std_acc_c_fixed_09:.4f} | {f1_c_fixed_09:.4f} ± {std_f1_c_fixed_09:.4f} |")
+        print(f"| 全监督（部分数据）        | {n_labeled} ({ratio*100:.2f}%) | {acc_noise:.3f} ± {std_acc_noise:.3f} | {f1_noise:.3f} ± {std_f1_noise:.3f} |")
+        print(f"| 算法 A (DASH)            | {n_labeled} ({ratio*100:.2f}%) | {acc_a:.3f} ± {std_acc_a:.3f} | {f1_a:.3f} ± {std_f1_a:.3f} |")
+        print(f"| 算法 B (带早停)          | {n_labeled} ({ratio*100:.2f}%) | {acc_b_full:.3f} ± {std_acc_b_full:.3f} | {f1_b_full:.3f} ± {std_f1_b_full:.3f} |")
+        print(f"| 算法 B (无早停)          | {n_labeled} ({ratio*100:.2f}%) | {acc_b_no_stop:.3f} ± {std_acc_b_no_stop:.3f} | {f1_b_no_stop:.3f} ± {std_f1_b_no_stop:.3f} |")
+        print(f"| 算法 C (固定置信度0.8)   | {n_labeled} ({ratio*100:.2f}%) | {acc_c_fixed_08:.3f} ± {std_acc_c_fixed_08:.3f} | {f1_c_fixed_08:.3f} ± {std_f1_c_fixed_08:.3f} |")
+        print(f"| 算法 C (固定置信度0.9)   | {n_labeled} ({ratio*100:.2f}%) | {acc_c_fixed_09:.3f} ± {std_acc_c_fixed_09:.3f} | {f1_c_fixed_09:.3f} ± {std_f1_c_fixed_09:.3f} |")
 
     print(f"\n表 2：伪标签数量、准确率、测试集性能和迭代次数对比 ({model_name})")
-    print("| 标记样本量 (比例) | 方法                     | 伪标签数 | 伪标签Acc | 测试集Acc | 测试集F1 | 迭代次数 |")
-    print("|-------------------|-------------------------|----------|-----------|----------|----------|----------|")
+    print("| 标记样本量 (比例) | 方法                     | 伪标签数 | 伪标签Acc     | 测试集Acc     | 测试集F1      | 迭代次数 |")
+    print("|-------------------|-------------------------|----------|--------------|--------------|--------------|----------|")
     for n_labeled, ratio, (pseudo_count_a, _), (pseudo_acc_a, std_pseudo_a), (acc_a, std_acc_a), (f1_a, std_f1_a), (pseudo_count_b_full, _), (pseudo_acc_b_full, std_pseudo_b_full), (acc_b_full, std_acc_b_full), (f1_b_full, std_f1_b_full), (pseudo_count_b_no_stop, _), (pseudo_acc_b_no_stop, std_pseudo_b_no_stop), (acc_b_no_stop, std_acc_b_no_stop), (f1_b_no_stop, std_f1_b_no_stop), (pseudo_count_c_fixed_08, _), (pseudo_acc_c_fixed_08, std_pseudo_c_fixed_08), (acc_c_fixed_08, std_acc_c_fixed_08), (f1_c_fixed_08, std_f1_c_fixed_08), (pseudo_count_c_fixed_09, _), (pseudo_acc_c_fixed_09, std_pseudo_c_fixed_09), (acc_c_fixed_09, std_acc_c_fixed_09), (f1_c_fixed_09, std_f1_c_fixed_09), (convergence_a_mean, convergence_a_std), (convergence_b_full_mean, convergence_b_full_std), (convergence_b_no_stop_mean, convergence_b_no_stop_std), (convergence_c_fixed_08_mean, convergence_c_fixed_08_std), (convergence_c_fixed_09_mean, convergence_c_fixed_09_std) in zip(
         [max(4, int(len(X_train) * r)) for r in [0.01, 0.02, 0.03]],
         final_result['ratio_list'],
@@ -875,95 +871,15 @@ def train_and_evaluate():
         final_result['c_fixed_08_convergence_list'],
         final_result['c_fixed_09_convergence_list']
     ):
-        print(f"| {n_labeled} ({ratio*100:.2f}%) | 算法 A (DASH)            | {int(pseudo_count_a)} | {pseudo_acc_a:.4f} ± {std_pseudo_a:.4f} | {acc_a:.4f} ± {std_acc_a:.4f} | {f1_a:.4f} ± {std_f1_a:.4f} | {convergence_a_mean:.1f} |")
-        print(f"| {n_labeled} ({ratio*100:.2f}%) | 算法 B (带早停)          | {int(pseudo_count_b_full)} | {pseudo_acc_b_full:.4f} ± {std_pseudo_b_full:.4f} | {acc_b_full:.4f} ± {std_acc_b_full:.4f} | {f1_b_full:.4f} ± {std_f1_b_full:.4f} | {convergence_b_full_mean:.1f} |")
-        print(f"| {n_labeled} ({ratio*100:.2f}%) | 算法 B (无早停)          | {int(pseudo_count_b_no_stop)} | {pseudo_acc_b_no_stop:.4f} ± {std_pseudo_b_no_stop:.4f} | {acc_b_no_stop:.4f} ± {std_acc_b_no_stop:.4f} | {f1_b_no_stop:.4f} ± {std_f1_b_no_stop:.4f} | {convergence_b_no_stop_mean:.1f} |")
-        print(f"| {n_labeled} ({ratio*100:.2f}%) | 算法 C (固定置信度0.8)   | {int(pseudo_count_c_fixed_08)} | {pseudo_acc_c_fixed_08:.4f} ± {std_pseudo_c_fixed_08:.4f} | {acc_c_fixed_08:.4f} ± {std_acc_c_fixed_08:.4f} | {f1_c_fixed_08:.4f} ± {std_f1_c_fixed_08:.4f} | {convergence_c_fixed_08_mean:.1f} |")
-        print(f"| {n_labeled} ({ratio*100:.2f}%) | 算法 C (固定置信度0.9)   | {int(pseudo_count_c_fixed_09)} | {pseudo_acc_c_fixed_09:.4f} ± {std_pseudo_c_fixed_09:.4f} | {acc_c_fixed_09:.4f} ± {std_acc_c_fixed_09:.4f} | {f1_c_fixed_09:.4f} ± {std_f1_c_fixed_09:.4f} | {convergence_c_fixed_09_mean:.1f} |")
+        print(f"| {n_labeled} ({ratio*100:.2f}%) | 算法 A (DASH)            | {int(pseudo_count_a)} | {pseudo_acc_a:.3f} ± {std_pseudo_a:.3f} | {acc_a:.3f} ± {std_acc_a:.3f} | {f1_a:.3f} ± {std_f1_a:.3f} | {convergence_a_mean:.1f} |")
+        print(f"| {n_labeled} ({ratio*100:.2f}%) | 算法 B (带早停)          | {int(pseudo_count_b_full)} | {pseudo_acc_b_full:.3f} ± {std_pseudo_b_full:.3f} | {acc_b_full:.3f} ± {std_acc_b_full:.3f} | {f1_b_full:.3f} ± {std_f1_b_full:.3f} | {convergence_b_full_mean:.1f} |")
+        print(f"| {n_labeled} ({ratio*100:.2f}%) | 算法 B (无早停)          | {int(pseudo_count_b_no_stop)} | {pseudo_acc_b_no_stop:.3f} ± {std_pseudo_b_no_stop:.3f} | {acc_b_no_stop:.3f} ± {std_acc_b_no_stop:.3f} | {f1_b_no_stop:.3f} ± {std_f1_b_no_stop:.3f} | {convergence_b_no_stop_mean:.1f} |")
+        print(f"| {n_labeled} ({ratio*100:.2f}%) | 算法 C (固定置信度0.8)   | {int(pseudo_count_c_fixed_08)} | {pseudo_acc_c_fixed_08:.3f} ± {std_pseudo_c_fixed_08:.3f} | {acc_c_fixed_08:.3f} ± {std_acc_c_fixed_08:.3f} | {f1_c_fixed_08:.3f} ± {std_f1_c_fixed_08:.3f} | {convergence_c_fixed_08_mean:.1f} |")
+        print(f"| {n_labeled} ({ratio*100:.2f}%) | 算法 C (固定置信度0.9)   | {int(pseudo_count_c_fixed_09)} | {pseudo_acc_c_fixed_09:.3f} ± {std_pseudo_c_fixed_09:.3f} | {acc_c_fixed_09:.3f} ± {std_acc_c_fixed_09:.3f} | {f1_c_fixed_09:.3f} ± {std_f1_c_fixed_09:.3f} | {convergence_c_fixed_09_mean:.1f} |")
 
-    chart_config_distance = {
-        "type": "line",
-        "data": {
-            "labels": list(range(21)),
-            "datasets": [
-                {
-                    "label": "1%",
-                    "data": [round(float(result['mean_distances_no_stop'][0][i]), 2) if i < len(result['mean_distances_no_stop'][0]) else None for i in range(21)],
-                    "borderColor": "#000000",
-                    "backgroundColor": "#000000",
-                    "pointStyle": "circle",
-                    "pointRadius": 4,
-                    "borderWidth": 0.8,
-                    "fill": False
-                },
-                {
-                    "label": "2%",
-                    "data": [round(float(result['mean_distances_no_stop'][1][i]), 2) if i < len(result['mean_distances_no_stop'][1]) else None for i in range(21)],
-                    "borderColor": "red",
-                    "backgroundColor": "red",
-                    "pointStyle": "rect",
-                    "pointRadius": 4,
-                    "borderWidth": 0.8,
-                    "fill": False
-                },
-                {
-                    "label": "3%",
-                    "data": [round(float(result['mean_distances_no_stop'][2][i]), 2) if i < len(result['mean_distances_no_stop'][2]) else None for i in range(21)],
-                    "borderColor": "blue",
-                    "backgroundColor": "blue",
-                    "pointStyle": "triangle",
-                    "pointRadius": 4,
-                    "borderWidth": 0.8,
-                    "fill": False
-                }
-            ]
-        },
-        "options": {
-            "responsive": True,
-            "maintainAspectRatio": False,
-            "aspectRatio": 0.5,
-            "title": {
-                "display": True,
-                "text": "距离随迭代变化 (不同标记比例)"
-            },
-            "legend": {
-                "display": True,
-                "position": "top",
-                "labels": {
-                    "boxWidth": 10,
-                    "fontColor": "#000000"
-                }
-            },
-            "scales": {
-                "x": {
-                    "title": {
-                        "display": True,
-                        "text": "迭代次数"
-                    },
-                    "ticks": {
-                        "min": 0,
-                        "max": 20,
-                        "stepSize": 1
-                    }
-                },
-                "y": {
-                    "title": {
-                        "display": True,
-                        "text": "平均距离"
-                    },
-                    "ticks": {
-                        "min": 0,
-                        "max": 3,
-                        "stepSize": 0.3
-                    }
-                }
-            }
-        }
-    }
-    print(f"\n### 图表: 距离随迭代变化 (不同标记比例)")
-    print(f"```chartjs")
-    print(json.dumps(chart_config_distance, indent=2))
-    print(f"```")
+    print(f"\n不同标记比例下每一轮迭代的平均距离")
+    for ratio, distances in zip(final_result['ratio_list'], final_result['mean_distances_no_stop']):
+        print(f"标记比例 {ratio*100:.2f}%: {distances}")
 
     return final_result
 
